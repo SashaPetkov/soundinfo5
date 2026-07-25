@@ -217,7 +217,7 @@ async function startListening() {
   }
 }
 
-// --- ИСПРАВЛЕННАЯ ОТПРАВКА БАЙТОВ ЧЕРЕЗ GGWAVE ---
+// --- ИСПРАВЛЕННЫЙ ВЫЗОВ ENCODE С 4 АРГУМЕНТАМИ ---
 async function sendAudioPacket(uint8Data) {
   if (!ggwaveInstance) {
     log("[ОШИБКА] ggwave еще не инициализирован!");
@@ -233,8 +233,20 @@ async function sendAudioPacket(uint8Data) {
   }
 
   try {
-    // 1 = Fast protocol в ggwave, 100 = громкость
-    const waveform = ggwaveInstance.encode(uint8Data, 1, 100); 
+    // Сигнатура ggwave.encode:
+    // 1-й аргумент: payload (Uint8Array / string)
+    // 2-й аргумент: protocolId (1 = Fast, 0 = Normal)
+    // 3-й аргумент: volume (100)
+    // 4-й аргумент: payloadLength (uint8Data.length) или кастомный параметр (0)
+    
+    let waveform;
+    try {
+      // Попытка 1: Передаем 4 аргумента ( payload, protocolId, volume, payloadLength )
+      waveform = ggwaveInstance.encode(uint8Data, 1, 100, uint8Data.length);
+    } catch (e1) {
+      // Резервный вариант, если сборка просит (payload, protocolId, volume, 0)
+      waveform = ggwaveInstance.encode(uint8Data, 1, 100, 0);
+    }
 
     if (!waveform || waveform.length === 0) {
       log("[ОШИБКА] Не удалось закодировать данные в ggwave.");
@@ -379,7 +391,7 @@ document.getElementById('btnSendData').addEventListener('click', async () => {
     log(`Отправка пакета ${i + 1}/${totalPackets}...`);
     await sendAudioPacket(fullPacket);
 
-    // Интервал 2 секунды между пакетами, чтобы эфир успел очиститься
+    // Интервал 2 секунды между пакетами
     await new Promise(resolve => setTimeout(resolve, 2000));
   }
   log("Передача всех пакетов завершена.");
