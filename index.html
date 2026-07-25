@@ -58,82 +58,86 @@
     .status.disconnected { background: #ffebe9; color: #cf222e; }
   </style>
   
-  <!-- Загружаем библиотеки ggwave и CryptoJS -->
   <script src="https://cdn.jsdelivr.net/npm/ggwave@0.2.0/ggwave.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
 </head>
 <body>
 
-  <h1>Звуковая передача данных (ggwave + WPA2-like Handshake)</h1>
+  <h1>Звуковая передача данных (ggwave + WPA2 Handshake)</h1>
 
   <div class="card">
-    <label for="role">Режим устройства:</label>
-    <select id="role">
-      <option value="sender">Передатчик (Sender)</option>
-      <option value="receiver">Приёмник (Receiver)</option>
-    </select>
-
-    <label for="psk">Общий секретный ключ (PSK / Пароль):</label>
+    <label for="psk">Общий секретный ключ (PSK):</label>
     <input type="text" id="psk" value="SecretWiFiPassword123">
-
     <div id="statusIndicator" class="status disconnected">Статус: Нет рукопожатия</div>
   </div>
 
   <div class="card">
     <h3>Управление</h3>
-    <button id="btnInitAudio">1. Инициализировать аудио</button>
-    <button id="btnStartHandshake">2. Начать Handshake (Аудио)</button>
+    <button id="btnInitAudio">1. Включить Микрофон / Аудио</button>
+    <button id="btnStartHandshake">2. Начать Handshake</button>
     
     <label for="message">Сообщение для передачи:</label>
-    <textarea id="message" rows="3">Hello Audio World! 100% Reliable Delivery.</textarea>
-    <button id="btnSendData" disabled>3. Отправить данные по пакетам</button>
+    <textarea id="message" rows="3">Hello Audio World! Reliable delivery test.</textarea>
+    <button id="btnSendData" disabled>3. Отправить пакеты</button>
   </div>
 
   <div class="card">
-    <h3>Консоль событий</h3>
+    <h3>Лог событий</h3>
     <div id="log"></div>
   </div>
 
 <script>
-// --- КОНСТАНТЫ ПРОТОКОЛА ---
 const PKT_TYPE_HANDSHAKE_INIT = 0x01;
 const PKT_TYPE_HANDSHAKE_RESP = 0x02;
 const PKT_TYPE_HANDSHAKE_ACK  = 0x03;
 const PKT_TYPE_DATA           = 0x04;
-const PKT_TYPE_ACK            = 0x05;
 
-const CHUNK_SIZE = 10; // Размер нагрузки в 1 пакете (байты)
+const CHUNK_SIZE = 10;
 
-let ggwaveInstance = null;
-let audioCtx = null;
-let micStream = null;
-let isListening = false;
+let ggwave = null;
+let instance = null;
+let context = null;
+let mediaStream = null;
+let recorder = null;
 
-// Состояние Handshake и ARQ
 let isHandshakeDone = false;
 let currentANonce = null;
 let currentSNonce = null;
 
-// Логирование в интерфейсе
 function log(msg) {
   const logDiv = document.getElementById('log');
   logDiv.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
   logDiv.scrollTop = logDiv.scrollHeight;
 }
 
-// --- СИГНАЛЫ УСПЕХА И ОШИБКИ (ACK / NACK TONES) ---
+// Преобразование Uint8Array в бинарную строку (исправляет ошибку Cannot convert ... to int)
+function uint8ToBinaryString(uint8Array) {
+  let str = "";
+  for (let i = 0; i < uint8Array.length; i++) {
+    str += String.fromCharCode(uint8Array[i]);
+  }
+  return str;
+}
+
+function convertTypedArray(src, type) {
+  var buffer = new ArrayBuffer(src.byteLength);
+  new src.constructor(buffer).set(src);
+  return new type(buffer);
+}
+
+// Звуковые ACK/NACK сигналы
 async function playToneSignal(isSuccess) {
-  if (!audioCtx) return;
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  if (!context) return;
+  if (context.state === 'suspended') await context.resume();
 
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
+  const osc = context.createOscillator();
+  const gain = context.createGain();
   osc.connect(gain);
-  gain.connect(audioCtx.destination);
+  gain.connect(context.destination);
 
-  const now = audioCtx.currentTime;
+  const now = context.currentTime;
   if (isSuccess) {
-    // Успех (ACK): Высокий восходящий двухтональный сигнал (880 Гц -> 1320 Гц)
+    // Успех (ACK): 880 Гц -> 1320 Гц
     osc.type = 'sine';
     osc.frequency.setValueAtTime(880, now);
     osc.frequency.setValueAtTime(1320, now + 0.15);
@@ -142,7 +146,7 @@ async function playToneSignal(isSuccess) {
     osc.start(now);
     osc.stop(now + 0.35);
   } else {
-    // Ошибка/Потеря (NACK): Низкий нисходящий пилообразный сигнал (300 Гц -> 150 Гц)
+    // Ошибка (NACK): 300 Гц -> 150 Гц
     osc.type = 'sawtooth';
     osc.frequency.setValueAtTime(300, now);
     osc.frequency.exponentialRampToValueAtTime(150, now + 0.3);
@@ -153,7 +157,6 @@ async function playToneSignal(isSuccess) {
   }
 }
 
-// --- CRC8 ДЛЯ ПРОВЕРКИ ЦЕЛОСТНОСТИ ПАКЕТА ---
 function calcCRC8(dataArray) {
   let crc = 0x00;
   for (let byte of dataArray) {
@@ -166,113 +169,82 @@ function calcCRC8(dataArray) {
   return crc;
 }
 
-// --- ИНИЦИАЛИЗАЦИЯ GGWAVE & WEBAUDIO ---
+// Инициализация
 document.getElementById('btnInitAudio').addEventListener('click', async () => {
   window.AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!audioCtx) {
-    audioCtx = new AudioContext();
+  if (!context) {
+    context = new AudioContext({sampleRate: 48000});
   }
-  
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
+  if (context.state === 'suspended') {
+    await context.resume();
   }
 
-  ggwave_factory().then((ggwave) => {
-    ggwaveInstance = ggwave;
-    log("ggwave.js успешно инициализирован. Состояние аудио: " + audioCtx.state);
-    startListening();
+  ggwave_factory().then((obj) => {
+    ggwave = obj;
+    const parameters = ggwave.getDefaultParameters();
+    parameters.sampleRateInp = context.sampleRate;
+    parameters.sampleRateOut = context.sampleRate;
+    instance = ggwave.init(parameters);
+    
+    log("ggwave успешно инициализирован.");
+    startCapturing();
   });
 });
 
-// --- СЛУШАТЕЛЬ МИКРОФОНА И ДЕКОДЕР ---
-async function startListening() {
-  if (isListening) return;
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const source = audioCtx.createMediaStreamSource(micStream);
-    const processor = audioCtx.createScriptProcessor(1024, 1, 1);
+function startCapturing() {
+  const constraints = { audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: false } };
 
-    processor.onaudioprocess = (e) => {
-      if (!ggwaveInstance) return;
+  navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+    mediaStream = context.createMediaStreamSource(stream);
+    recorder = context.createScriptProcessor(1024, 1, 1);
+
+    recorder.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
-      
-      // Преобразование Float32 [-1, 1] в Int16 для ggwave
-      const buf = new Int16Array(inputData.length);
-      for (let i = 0; i < inputData.length; i++) {
-        buf[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
-      }
+      const res = ggwave.decode(instance, convertTypedArray(new Float32Array(inputData), Int8Array));
 
-      const res = ggwaveInstance.decode(buf);
       if (res && res.length > 0) {
         handleIncomingPacket(new Uint8Array(res));
       }
     };
 
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    isListening = true;
-    log("Микрофон подключен. Слушаем эфир...");
-  } catch (err) {
-    log("Ошибка доступа к микрофону: " + err);
-  }
+    mediaStream.connect(recorder);
+    recorder.connect(context.destination);
+    log("Микрофон слушает эфир...");
+  }).catch((err) => log("Ошибка микрофона: " + err));
 }
 
-// --- ИСПРАВЛЕННЫЙ ВЫЗОВ ENCODE С 4 АРГУМЕНТАМИ ---
+// Отправка пакетов в звуковой эфир
 async function sendAudioPacket(uint8Data) {
-  if (!ggwaveInstance) {
-    log("[ОШИБКА] ggwave еще не инициализирован!");
-    return;
-  }
-  if (!audioCtx) {
-    log("[ОШИБКА] Нажмите '1. Инициализировать аудио'!");
-    return;
-  }
-
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
-  }
+  if (!ggwave || !instance) return;
+  if (context.state === 'suspended') await context.resume();
 
   try {
-    // Сигнатура ggwave.encode:
-    // 1-й аргумент: payload (Uint8Array / string)
-    // 2-й аргумент: protocolId (1 = Fast, 0 = Normal)
-    // 3-й аргумент: volume (100)
-    // 4-й аргумент: payloadLength (uint8Data.length) или кастомный параметр (0)
-    
-    let waveform;
-    try {
-      // Попытка 1: Передаем 4 аргумента ( payload, protocolId, volume, payloadLength )
-      waveform = ggwaveInstance.encode(uint8Data, 1, 100, uint8Data.length);
-    } catch (e1) {
-      // Резервный вариант, если сборка просит (payload, protocolId, volume, 0)
-      waveform = ggwaveInstance.encode(uint8Data, 1, 100, 0);
-    }
+    // ВАЖНО: Преобразуем Uint8Array в бинарную строку перед передачей в encode
+    const binaryStrPayload = uint8ToBinaryString(uint8Data);
 
-    if (!waveform || waveform.length === 0) {
-      log("[ОШИБКА] Не удалось закодировать данные в ggwave.");
-      return;
-    }
+    const waveform = ggwave.encode(
+      instance, 
+      binaryStrPayload, 
+      ggwave.ProtocolId.GGWAVE_PROTOCOL_AUDIBLE_FAST, 
+      10
+    );
 
-    const buf = audioCtx.createBuffer(1, waveform.length, audioCtx.sampleRate);
-    const channelData = buf.getChannelData(0);
-    
-    // Преобразуем Int16 данные ggwave во Float32 [-1.0, 1.0] для Web Audio API
-    for (let i = 0; i < waveform.length; i++) {
-      channelData[i] = waveform[i] / 32768.0;
-    }
+    const buf = convertTypedArray(waveform, Float32Array);
+    const buffer = context.createBuffer(1, buf.length, context.sampleRate);
+    buffer.getChannelData(0).set(buf);
 
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
-    src.start(0);
-    
-    log("Звуковой пакет отправлен в динамики.");
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    source.start(0);
+
+    log("Пакет отправлен в динамики.");
   } catch (err) {
     log("[ОШИБКА Воспроизведения]: " + err.message);
   }
 }
 
-// --- ОБРАБОТЧИК ВХОДЯЩИХ ПАКЕТОВ ---
+// Обработка пакетов
 function handleIncomingPacket(bytes) {
   if (bytes.length < 5) return;
 
@@ -283,118 +255,89 @@ function handleIncomingPacket(bytes) {
   const payload = bytes.slice(4, 4 + payloadLen);
   const receivedCRC = bytes[4 + payloadLen];
 
-  // Проверка целостности через CRC8
-  const calculatedCRC = calcCRC8(bytes.slice(0, 4 + payloadLen));
-  if (receivedCRC !== calculatedCRC) {
-    log(`[ОШИБКА] Пакет #${pktId} поврежден (ошибка CRC).`);
-    playToneSignal(false); // Издаем сигнал ошибки NACK
+  if (receivedCRC !== calcCRC8(bytes.slice(0, 4 + payloadLen))) {
+    log(`[ОШИБКА] Поврежден пакет #${pktId} (ошибка CRC)`);
+    playToneSignal(false); // Звук NACK
     return;
   }
 
-  log(`[ВХОДЯЩИЙ] Тип: 0x${type.toString(16)}, PktID: ${pktId}/${totalPkts}`);
-
   const psk = document.getElementById('psk').value;
 
-  // --- ОБРАБОТКА HANDSHAKE ---
   if (type === PKT_TYPE_HANDSHAKE_INIT) {
     currentANonce = CryptoJS.lib.WordArray.create(payload).toString();
     currentSNonce = CryptoJS.lib.WordArray.random(8).toString();
-    
-    // HMAC(PSK, ANonce + SNonce)
     const hmac = CryptoJS.HmacSHA256(currentANonce + currentSNonce, psk).toString();
     
-    log("Получен INIT. Отправка HANDSHAKE_RESP...");
-    const respPayload = new TextEncoder().encode(currentSNonce + ":" + hmac.substring(0, 8));
-    sendControlPacket(PKT_TYPE_HANDSHAKE_RESP, respPayload);
+    log("Получен INIT. Отправка RESP...");
+    sendControlPacket(PKT_TYPE_HANDSHAKE_RESP, new TextEncoder().encode(currentSNonce + ":" + hmac.substring(0, 8)));
   } 
   else if (type === PKT_TYPE_HANDSHAKE_RESP) {
     const text = new TextDecoder().decode(payload);
     const [sNonce, hmacPart] = text.split(":");
-    
     const expectedHmac = CryptoJS.HmacSHA256(currentANonce + sNonce, psk).toString().substring(0, 8);
+    
     if (hmacPart === expectedHmac) {
       log("Handshake УСПЕШНО ЗАВЕРШЁН!");
       setHandshakeState(true);
       sendControlPacket(PKT_TYPE_HANDSHAKE_ACK, new Uint8Array([0x01]));
-      playToneSignal(true);
+      playToneSignal(true); // Звук ACK
     } else {
-      log("[ОШИБКА HANDSHAKE] Неверный ключ PSK!");
-      playToneSignal(false);
+      log("[ОШИБКА] Неверный PSK ключ!");
+      playToneSignal(false); // Звук NACK
     }
   } 
   else if (type === PKT_TYPE_HANDSHAKE_ACK) {
-    log("Получен ACK рукопожатия. Связь установлена.");
+    log("Защищенное соединение подтверждено.");
     setHandshakeState(true);
-    playToneSignal(true);
-  }
-  // --- ОБРАБОТКА ДАННЫХ ---
+    playToneSignal(true); // Звук ACK
+  } 
   else if (type === PKT_TYPE_DATA) {
     if (!isHandshakeDone) {
-      log("[ОТКЛОНЕНО] Пакет данных получен до завершения Handshake!");
+      log("[ОТКЛОНЕНО] Пакет без Handshake!");
       playToneSignal(false);
       return;
     }
-
-    log(`[УСПЕХ] Пакет #${pktId} успешно принят: "${new TextDecoder().decode(payload)}"`);
-    playToneSignal(true); // Аудио подтверждение успеха
+    log(`[ПРИНЯТО #${pktId}/${totalPkts}]: "${new TextDecoder().decode(payload)}"`);
+    playToneSignal(true); // Звук ACK
   }
 }
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 function sendControlPacket(type, payloadUint8) {
   const header = [type, 0, 1, payloadUint8.length];
   const packetWithoutCRC = [...header, ...payloadUint8];
   const crc = calcCRC8(packetWithoutCRC);
-  const fullPacket = new Uint8Array([...packetWithoutCRC, crc]);
-  
-  sendAudioPacket(fullPacket);
+  sendAudioPacket(new Uint8Array([...packetWithoutCRC, crc]));
 }
 
 function setHandshakeState(done) {
   isHandshakeDone = done;
   const ind = document.getElementById('statusIndicator');
-  if (done) {
-    ind.className = "status connected";
-    ind.textContent = "Статус: Защищенное соединение установлено";
-    document.getElementById('btnSendData').disabled = false;
-  } else {
-    ind.className = "status disconnected";
-    ind.textContent = "Статус: Нет рукопожатия";
-    document.getElementById('btnSendData').disabled = true;
-  }
+  ind.className = done ? "status connected" : "status disconnected";
+  ind.textContent = done ? "Статус: Защищенное соединение установлено" : "Статус: Нет рукопожатия";
+  document.getElementById('btnSendData').disabled = !done;
 }
 
-// --- ЗАПУСК HANDSHAKE ---
 document.getElementById('btnStartHandshake').addEventListener('click', () => {
   currentANonce = CryptoJS.lib.WordArray.random(8).toString();
-  log("Инициализация Handshake (отправка ANonce)...");
+  log("Запуск Handshake...");
   sendControlPacket(PKT_TYPE_HANDSHAKE_INIT, new TextEncoder().encode(currentANonce));
 });
 
-// --- ПАКЕТИРОВАНИЕ И ОТПРАВКА ДАННЫХ ---
 document.getElementById('btnSendData').addEventListener('click', async () => {
   const text = document.getElementById('message').value;
   const dataBytes = new TextEncoder().encode(text);
-  
   const totalPackets = Math.ceil(dataBytes.length / CHUNK_SIZE);
-  log(`Начало передачи: ${dataBytes.length} байт (${totalPackets} пакетов)...`);
 
   for (let i = 0; i < totalPackets; i++) {
-    const start = i * CHUNK_SIZE;
-    const chunk = dataBytes.slice(start, start + CHUNK_SIZE);
-    
+    const chunk = dataBytes.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
     const header = [PKT_TYPE_DATA, i + 1, totalPackets, chunk.length];
     const packetWithoutCRC = [...header, ...chunk];
     const crc = calcCRC8(packetWithoutCRC);
-    const fullPacket = new Uint8Array([...packetWithoutCRC, crc]);
 
     log(`Отправка пакета ${i + 1}/${totalPackets}...`);
-    await sendAudioPacket(fullPacket);
-
-    // Интервал 2 секунды между пакетами
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await sendAudioPacket(new Uint8Array([...packetWithoutCRC, crc]));
+    await new Promise(r => setTimeout(r, 2000));
   }
-  log("Передача всех пакетов завершена.");
 });
 </script>
 </body>
