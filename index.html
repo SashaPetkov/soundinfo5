@@ -37,6 +37,7 @@
       cursor: pointer;
     }
     button:hover { background: #0052a3; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
     #log {
       background: #1e1e1e;
       color: #00ff66;
@@ -109,12 +110,11 @@ let micStream = null;
 let isListening = false;
 
 // Состояние Handshake и ARQ
-let sessionKey = null;
 let isHandshakeDone = false;
 let currentANonce = null;
 let currentSNonce = null;
 
-// Вспомогательное логирование
+// Логирование в интерфейсе
 function log(msg) {
   const logDiv = document.getElementById('log');
   logDiv.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
@@ -122,8 +122,10 @@ function log(msg) {
 }
 
 // --- СИГНАЛЫ УСПЕХА И ОШИБКИ (ACK / NACK TONES) ---
-function playToneSignal(isSuccess) {
+async function playToneSignal(isSuccess) {
   if (!audioCtx) return;
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   osc.connect(gain);
@@ -131,7 +133,7 @@ function playToneSignal(isSuccess) {
 
   const now = audioCtx.currentTime;
   if (isSuccess) {
-    // Успех: Двухтональный высокий сигнал (880 Гц -> 1320 Гц)
+    // Успех (ACK): Высокий восходящий двухтональный сигнал (880 Гц -> 1320 Гц)
     osc.type = 'sine';
     osc.frequency.setValueAtTime(880, now);
     osc.frequency.setValueAtTime(1320, now + 0.15);
@@ -140,7 +142,7 @@ function playToneSignal(isSuccess) {
     osc.start(now);
     osc.stop(now + 0.35);
   } else {
-    // Ошибка/Потеря: Низкий нисходящий пилообразный сигнал (300 Гц -> 150 Гц)
+    // Ошибка/Потеря (NACK): Низкий нисходящий пилообразный сигнал (300 Гц -> 150 Гц)
     osc.type = 'sawtooth';
     osc.frequency.setValueAtTime(300, now);
     osc.frequency.exponentialRampToValueAtTime(150, now + 0.3);
@@ -164,14 +166,20 @@ function calcCRC8(dataArray) {
   return crc;
 }
 
-// --- ИНИЦИАЛИЗАУЦИЯ GGWAVE & WEBAUDIO ---
+// --- ИНИЦИАЛИЗАЦИЯ GGWAVE & WEBAUDIO ---
 document.getElementById('btnInitAudio').addEventListener('click', async () => {
   window.AudioContext = window.AudioContext || window.webkitAudioContext;
-  audioCtx = new AudioContext();
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+  }
+  
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
 
   ggwave_factory().then((ggwave) => {
     ggwaveInstance = ggwave;
-    log("ggwave.js успешно инициализирован.");
+    log("ggwave.js успешно инициализирован. Состояние аудио: " + audioCtx.state);
     startListening();
   });
 });
@@ -188,7 +196,7 @@ async function startListening() {
       if (!ggwaveInstance) return;
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Преобразование Float32 в Int16 для ggwave
+      // Преобразование Float32 [-1, 1] в Int16 для ggwave
       const buf = new Int16Array(inputData.length);
       for (let i = 0; i < inputData.length; i++) {
         buf[i] = Math.max(-1, Math.min(1, inputData[i])) * 32767;
@@ -209,24 +217,52 @@ async function startListening() {
   }
 }
 
-// --- ОТПРАВКА БАЙТОВ ЧЕРЕЗ GGWAVE ---
-function sendAudioPacket(uint8Data) {
-  if (!ggwaveInstance || !audioCtx) return;
+// --- ИСПРАВЛЕННАЯ ОТПРАВКА БАЙТОВ ЧЕРЕЗ GGWAVE ---
+async function sendAudioPacket(uint8Data) {
+  if (!ggwaveInstance) {
+    log("[ОШИБКА] ggwave еще не инициализирован!");
+    return;
+  }
+  if (!audioCtx) {
+    log("[ОШИБКА] Нажмите '1. Инициализировать аудио'!");
+    return;
+  }
 
-  // Используем быстрый протокол Fast (ID 1 в ggwave)
-  const waveform = ggwaveInstance.encode(uint8Data, 1, 100); 
-  const buf = audioCtx.createBuffer(1, waveform.length, audioCtx.sampleRate);
-  buf.getChannelData(0).set(waveform);
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
 
-  const src = audioCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(audioCtx.destination);
-  src.start();
+  try {
+    // 1 = Fast protocol в ggwave, 100 = громкость
+    const waveform = ggwaveInstance.encode(uint8Data, 1, 100); 
+
+    if (!waveform || waveform.length === 0) {
+      log("[ОШИБКА] Не удалось закодировать данные в ggwave.");
+      return;
+    }
+
+    const buf = audioCtx.createBuffer(1, waveform.length, audioCtx.sampleRate);
+    const channelData = buf.getChannelData(0);
+    
+    // Преобразуем Int16 данные ggwave во Float32 [-1.0, 1.0] для Web Audio API
+    for (let i = 0; i < waveform.length; i++) {
+      channelData[i] = waveform[i] / 32768.0;
+    }
+
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start(0);
+    
+    log("Звуковой пакет отправлен в динамики.");
+  } catch (err) {
+    log("[ОШИБКА Воспроизведения]: " + err.message);
+  }
 }
 
 // --- ОБРАБОТЧИК ВХОДЯЩИХ ПАКЕТОВ ---
 function handleIncomingPacket(bytes) {
-  if (bytes.length < 5) return; // Минимальный размер пакета
+  if (bytes.length < 5) return;
 
   const type = bytes[0];
   const pktId = bytes[1];
@@ -235,11 +271,11 @@ function handleIncomingPacket(bytes) {
   const payload = bytes.slice(4, 4 + payloadLen);
   const receivedCRC = bytes[4 + payloadLen];
 
-  // Проверка CRC8
+  // Проверка целостности через CRC8
   const calculatedCRC = calcCRC8(bytes.slice(0, 4 + payloadLen));
   if (receivedCRC !== calculatedCRC) {
     log(`[ОШИБКА] Пакет #${pktId} поврежден (ошибка CRC).`);
-    playToneSignal(false); // Низкий сигнал ошибки NACK
+    playToneSignal(false); // Издаем сигнал ошибки NACK
     return;
   }
 
@@ -252,7 +288,7 @@ function handleIncomingPacket(bytes) {
     currentANonce = CryptoJS.lib.WordArray.create(payload).toString();
     currentSNonce = CryptoJS.lib.WordArray.random(8).toString();
     
-    // Включение в ответе HMAC(PSK, ANonce + SNonce)
+    // HMAC(PSK, ANonce + SNonce)
     const hmac = CryptoJS.HmacSHA256(currentANonce + currentSNonce, psk).toString();
     
     log("Получен INIT. Отправка HANDSHAKE_RESP...");
@@ -279,7 +315,7 @@ function handleIncomingPacket(bytes) {
     setHandshakeState(true);
     playToneSignal(true);
   }
-  // --- ОБРАБОТКА ДАННЫХ И ARQ ---
+  // --- ОБРАБОТКА ДАННЫХ ---
   else if (type === PKT_TYPE_DATA) {
     if (!isHandshakeDone) {
       log("[ОТКЛОНЕНО] Пакет данных получен до завершения Handshake!");
@@ -288,14 +324,11 @@ function handleIncomingPacket(bytes) {
     }
 
     log(`[УСПЕХ] Пакет #${pktId} успешно принят: "${new TextDecoder().decode(payload)}"`);
-    playToneSignal(true); // Аудио подтверждение успеха приема
-    
-    // Отправляем ACK обратным аудио-пакетом (опционально)
-    sendControlPacket(PKT_TYPE_ACK, new Uint8Array([pktId]));
+    playToneSignal(true); // Аудио подтверждение успеха
   }
 }
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ УПРАВЛЕНИЯ ПАКЕТАМИ ---
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 function sendControlPacket(type, payloadUint8) {
   const header = [type, 0, 1, payloadUint8.length];
   const packetWithoutCRC = [...header, ...payloadUint8];
@@ -326,7 +359,7 @@ document.getElementById('btnStartHandshake').addEventListener('click', () => {
   sendControlPacket(PKT_TYPE_HANDSHAKE_INIT, new TextEncoder().encode(currentANonce));
 });
 
-// --- ПАКЕТИРОВАНИЕ И ОТПРАВКА ДАННЫХ (ARQ / STOP-AND-WAIT) ---
+// --- ПАКЕТИРОВАНИЕ И ОТПРАВКА ДАННЫХ ---
 document.getElementById('btnSendData').addEventListener('click', async () => {
   const text = document.getElementById('message').value;
   const dataBytes = new TextEncoder().encode(text);
@@ -344,10 +377,10 @@ document.getElementById('btnSendData').addEventListener('click', async () => {
     const fullPacket = new Uint8Array([...packetWithoutCRC, crc]);
 
     log(`Отправка пакета ${i + 1}/${totalPackets}...`);
-    sendAudioPacket(fullPacket);
+    await sendAudioPacket(fullPacket);
 
-    // Пауза 1.8с между пакетами, чтобы аудио-эфир успел освободиться
-    await new Promise(resolve => setTimeout(resolve, 1800));
+    // Интервал 2 секунды между пакетами, чтобы эфир успел очиститься
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
   log("Передача всех пакетов завершена.");
 });
